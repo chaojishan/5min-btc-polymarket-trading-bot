@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![Polymarket](https://img.shields.io/badge/Polymarket-CLOB-blue)](https://polymarket.com)
 
-**Repository:** [github.com/baker42757/5min-btc-polymarket-trading-bot](https://github.com/baker42757/5min-btc-polymarket-trading-bot)
+**Repository:** [github.com/gabagool23/5min-btc-polymarket-trading-bot](https://github.com/gabagool23/5min-btc-polymarket-trading-bot)
 
 ---
 
@@ -159,7 +159,7 @@ This bot is for **educational and research purposes**. Trading prediction market
 
 ## Contact
 
-Telegram: [@baker1119](https://t.me/baker1119)
+Telegram: [@gabagool21](https://t.me/gabagool21)
 
 <div align="left">
   <a href="https://t.me/baker1119">
