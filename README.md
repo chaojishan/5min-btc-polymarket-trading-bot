@@ -162,7 +162,7 @@ This bot is for **educational and research purposes**. Trading prediction market
 Telegram: [@gabagool21](https://t.me/gabagool21)
 
 <div align="left">
-  <a href="https://t.me/baker1119">
+  <a href="https://t.me/gabagool21">
     <img height="30" src="https://img.shields.io/badge/Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
   </a>
 </div>
