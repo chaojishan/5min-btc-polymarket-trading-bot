@@ -34,6 +34,15 @@ We buy **Up** and **Down** so that **cost per pair (Up + Down) < $1**. Whichever
 
 ---
 
+## How to run this bot
+
+
+
+https://github.com/user-attachments/assets/434c9fa4-c8c6-44d8-8507-4c8883a7b152
+
+
+---
+
 ## Features
 
 - **5-minute BTC only:** Trades **5m** binary Up/Down markets for **BTC** on [Polymarket](https://polymarket.com).
