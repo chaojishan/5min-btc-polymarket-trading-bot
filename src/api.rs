@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Instant;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
@@ -489,6 +490,7 @@ impl PolymarketApi {
     }
 
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
+        let auth_start = Instant::now();
         let signer = self.create_signer()?;
         
         // Build authentication builder with proxy wallet support
@@ -509,6 +511,7 @@ impl PolymarketApi {
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        let auth_ms = auth_start.elapsed().as_secs_f64() * 1000.0;
         
         // Convert order side string to SDK Side enum
         let side = match order.side.as_str() {
@@ -532,10 +535,16 @@ impl PolymarketApi {
             .price(price)
             .side(side);
         
-        let signed_order = client.sign(&signer, order_builder.build().await?)
+        let build_start = Instant::now();
+        let built = order_builder.build().await.context("Failed to build limit order")?;
+        let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+        let sign_start = Instant::now();
+        let signed_order = client.sign(&signer, built)
             .await
             .context("Failed to sign order")?;
+        let sign_ms = sign_start.elapsed().as_secs_f64() * 1000.0;
         
+        let submit_at = Instant::now();
         let response = match client.post_order(signed_order).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -543,10 +552,23 @@ impl PolymarketApi {
                 anyhow::bail!("Failed to post order: {:?}", e);
             }
         };
+        let post_ms = submit_at.elapsed().as_secs_f64() * 1000.0;
+        
+        eprintln!("[timing] limit order — authenticate: {:.2} ms | build: {:.2} ms | sign: {:.2} ms | post_order: {:.2} ms",
+            auth_ms, build_ms, sign_ms, post_ms);
         
         if !response.success {
             let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
             error!("Order rejected by API: {}", error_msg);
+            eprintln!(
+                "[timing] post_order result: success=false, order_id={}",
+                response.order_id
+            );
+        } else {
+            eprintln!(
+                "[timing] post_order result: success=true, order_id={}",
+                response.order_id
+            );
         }
         
         let order_response = OrderResponse {
@@ -566,7 +588,15 @@ impl PolymarketApi {
         amount: f64,
         side: &str,
         order_type: Option<&str>,
+        signal_start: Instant,
     ) -> Result<OrderResponse> {
+        let enter_api_ms = signal_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[timing] signal→place_market_order entry: {:.2} ms (branch logs + execute_buy_fak prep)",
+            enter_api_ms
+        );
+
+        let auth_start = Instant::now();
         let signer = self.create_signer()?;
         
         // Build authentication builder with proxy wallet support
@@ -586,6 +616,7 @@ impl PolymarketApi {
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        let auth_ms = auth_start.elapsed().as_secs_f64() * 1000.0;
         
         let side_enum = match side {
             "BUY" => Side::Buy,
@@ -609,6 +640,7 @@ impl PolymarketApi {
         eprintln!("Creating and posting MARKET order: {} {} {} (type: {:?})", 
               side, amount_decimal, token_id, order_type_enum);
         
+        let price_start = Instant::now();
         let market_price = if matches!(side_enum, Side::Buy) {
             self.get_price(token_id, "SELL")
                 .await
@@ -618,6 +650,7 @@ impl PolymarketApi {
                 .await
                 .context("Failed to fetch BID price for SELL order")?
         };
+        let get_price_ms = price_start.elapsed().as_secs_f64() * 1000.0;
         
         eprintln!("Using current market price: ${:.4} for {} order", market_price, side);
         
@@ -628,9 +661,17 @@ impl PolymarketApi {
             .price(market_price)
             .side(side_enum);
         
-        let signed_order = client.sign(&signer, order_builder.build().await?)
+        let build1_start = Instant::now();
+        let built1 = order_builder
+            .build()
+            .await
+            .context("Failed to build market order")?;
+        let build1_ms = build1_start.elapsed().as_secs_f64() * 1000.0;
+        let sign1_start = Instant::now();
+        let signed_order_first = client.sign(&signer, built1)
             .await
             .context("Failed to sign market order")?;
+        let sign1_ms = sign1_start.elapsed().as_secs_f64() * 1000.0;
         
         let final_price = if matches!(side_enum, Side::Sell) {
             let price_f64 = f64::try_from(market_price).unwrap_or(0.0);
@@ -644,7 +685,7 @@ impl PolymarketApi {
             market_price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
         };
         
-        let signed_order = if matches!(side_enum, Side::Sell) && final_price != market_price {
+        let (signed_order, build2_ms, sign2_ms) = if matches!(side_enum, Side::Sell) && final_price != market_price {
             let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
             let market_price_f64 = f64::try_from(market_price).unwrap_or(0.0);
             eprintln!("Adjusting SELL price from ${:.4} to ${:.4} for immediate execution", market_price_f64, final_price_f64);
@@ -654,15 +695,25 @@ impl PolymarketApi {
                 .size(amount_decimal)
                 .price(final_price)
                 .side(side_enum);
-            client.sign(&signer, adjusted_builder.build().await?)
+            let build2_start = Instant::now();
+            let built2 = adjusted_builder
+                .build()
                 .await
-                .context("Failed to sign adjusted market order")?
+                .context("Failed to build adjusted market order")?;
+            let b2 = build2_start.elapsed().as_secs_f64() * 1000.0;
+            let sign2_start = Instant::now();
+            let so = client.sign(&signer, built2)
+                .await
+                .context("Failed to sign adjusted market order")?;
+            let s2 = sign2_start.elapsed().as_secs_f64() * 1000.0;
+            (so, Some(b2), Some(s2))
         } else {
-            signed_order
+            (signed_order_first, None, None)
         };
         
         let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
         
+        let submit_at = Instant::now();
         let response = match client.post_order(signed_order).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -670,6 +721,20 @@ impl PolymarketApi {
                 anyhow::bail!("Failed to post market order: {:?}", e);
             }
         };
+        let post_ms = submit_at.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = signal_start.elapsed().as_secs_f64() * 1000.0;
+        
+        eprintln!("[timing] --- market order breakdown (from signal) ---");
+        eprintln!("[timing]   authenticate (signer+client): {:.2} ms", auth_ms);
+        eprintln!("[timing]   get_price: {:.2} ms", get_price_ms);
+        eprintln!("[timing]   order build #1: {:.2} ms", build1_ms);
+        eprintln!("[timing]   order sign #1: {:.2} ms", sign1_ms);
+        if let (Some(b), Some(s)) = (build2_ms, sign2_ms) {
+            eprintln!("[timing]   order build #2 (sell adjust): {:.2} ms", b);
+            eprintln!("[timing]   order sign #2: {:.2} ms", s);
+        }
+        eprintln!("[timing]   post_order: {:.2} ms", post_ms);
+        eprintln!("[timing]   TOTAL signal→response: {:.2} ms", total_ms);
         
         let order_response = OrderResponse {
             order_id: Some(response.order_id.clone()),
@@ -723,10 +788,12 @@ impl PolymarketApi {
         eprintln!("Posting order to Polymarket (HMAC): {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
 
+        let submit_at = Instant::now();
         let response = request
             .send()
             .await
             .context("Failed to place order")?;
+        let post_ms = submit_at.elapsed().as_secs_f64() * 1000.0;
 
         let status = response.status();
         if !status.is_success() {
@@ -743,6 +810,10 @@ impl PolymarketApi {
             .await
             .context("Failed to parse order response")?;
 
+        eprintln!(
+            "[timing] HMAC post_order: {:.2} ms (submit → HTTP success + JSON, order_id={:?})",
+            post_ms, order_response.order_id
+        );
         eprintln!("Order placed successfully: {:?}", order_response);
         Ok(order_response)
     }

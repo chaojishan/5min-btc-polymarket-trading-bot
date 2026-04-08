@@ -10,6 +10,7 @@ use anyhow::Result;
 use log::warn;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 const PRICE_HISTORY_LEN: usize = 5;
@@ -410,6 +411,7 @@ impl Trader {
         let down_token_id = market_data.down_token.as_ref().map(|t| t.token_id.clone());
 
         if do_buy_up {
+            let signal_start = Instant::now();
             let cost_pp = if pairs_after_up > 0.0 { cost_per_pair_up } else { up_ask };
             crate::log_println!(
                 "📈 {}: buy Up | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
@@ -435,10 +437,12 @@ impl Trader {
             if self.simulation_mode {
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_token_id.as_deref().unwrap_or(""), size, up_ask).await?;
             } else if let Some(ref up_id) = up_token_id {
-                self.execute_buy_fak(market_name, "Up", up_id, size, up_ask).await?;
+                self.execute_buy_fak(market_name, "Up", up_id, size, up_ask, signal_start)
+                    .await?;
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_id, size, up_ask).await?;
             }
         } else {
+            let signal_start = Instant::now();
             let cost_pp = if pairs_after_down > 0.0 { cost_per_pair_down } else { down_ask };
             crate::log_println!(
                 "📉 {}: buy Down | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
@@ -464,7 +468,8 @@ impl Trader {
             if self.simulation_mode {
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_token_id.as_deref().unwrap_or(""), size, down_ask).await?;
             } else if let Some(ref down_id) = down_token_id {
-                self.execute_buy_fak(market_name, "Down", down_id, size, down_ask).await?;
+                self.execute_buy_fak(market_name, "Down", down_id, size, down_ask, signal_start)
+                    .await?;
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_id, size, down_ask).await?;
             }
         }
@@ -505,6 +510,7 @@ impl Trader {
         token_id: &str,
         shares: f64,
         price: f64,
+        signal_start: Instant,
     ) -> Result<()> {
         crate::log_println!(
             "{} BUY {} {:.2} shares @ ${:.4} (FAK - partial fill possible)",
@@ -513,7 +519,7 @@ impl Trader {
         let shares_rounded = (shares * 10000.0).round() / 10000.0;
         match self
             .api
-            .place_market_order(token_id, shares_rounded, "BUY", Some("FAK"))
+            .place_market_order(token_id, shares_rounded, "BUY", Some("FAK"), signal_start)
             .await
         {
             Ok(_) => crate::log_println!("REAL: FAK order placed"),
