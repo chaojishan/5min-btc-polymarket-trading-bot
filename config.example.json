@@ -1,0 +1,32 @@
+{
+  "polymarket": {
+    "gamma_api_url": "https://gamma-api.polymarket.com",
+    "clob_api_url": "https://clob.polymarket.com",
+    "api_key": "",
+    "api_secret": "",
+    "api_passphrase": "",
+    "private_key": "",
+    "proxy_wallet_address": "",
+    "signature_type": 1
+  },
+  "trading": {
+    "check_interval_ms": 1000,
+    "market_closure_check_interval_seconds": 20,
+    "data_source": "websocket",
+    "markets": [
+      "btc"
+    ],
+    "timeframes": [
+      "5m"
+    ],
+    "cost_per_pair_max": 0.99,
+    "min_side_price": 0.05,
+    "max_side_price": 0.99,
+    "cooldown_seconds": 0,
+    "cooldown_seconds_1h": 45,
+    "shares": null,
+    "size_reduce_after_secs": 300,
+    "size_min_ratio": 0.5,
+    "size_min_shares": 5.0
+  }
+}

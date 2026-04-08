@@ -5,4 +5,3 @@ config.json
 *.log
 history.toml
 .env
-config.example.json

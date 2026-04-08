@@ -14,7 +14,7 @@ use std::sync::Arc;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
 use polymarket_client_sdk::POLYGON;
-use alloy::signers::local::LocalSigner;
+use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
 
@@ -56,6 +56,47 @@ pub struct PolymarketApi {
 }
 
 impl PolymarketApi {
+    fn create_signer(&self) -> Result<PrivateKeySigner> {
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
+        LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")
+            .map(|s| s.with_chain_id(Some(POLYGON)))
+    }
+
+    fn resolve_auth_config(
+        &self,
+        warn_on_proxy_eoa: bool,
+    ) -> Result<(Option<AlloyAddress>, Option<SignatureType>)> {
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => {
+                    if warn_on_proxy_eoa {
+                        warn!("proxy_wallet_address is set but signature_type is EOA. Defaulting to Proxy.");
+                    }
+                    SignatureType::Proxy
+                },
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            return Ok((Some(funder_address), Some(sig_type)));
+        }
+
+        if let Some(sig_type_num) = self.signature_type {
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            return Ok((None, Some(sig_type)));
+        }
+
+        Ok((None, None))
+    }
+
     pub fn new(
         gamma_url: String,
         clob_url: String,
@@ -88,46 +129,23 @@ impl PolymarketApi {
 
     /// Authenticate with Polymarket CLOB API at startup
     pub async fn authenticate(&self) -> Result<()> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for authentication. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
+        let signer = self.create_signer()
+            .context("Private key is required for authentication. Please set private_key in config.json")?;
         
         // Build authentication builder with proxy wallet support
         let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
+
+        let (funder, sig_type) = self.resolve_auth_config(true)?;
+        if let Some(funder_address) = funder {
             auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => {
-                    warn!("proxy_wallet_address is set but signature_type is EOA. Defaulting to Proxy.");
-                    SignatureType::Proxy
-                },
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
+        }
+        if let Some(sig_type) = sig_type {
             auth_builder = auth_builder.signature_type(sig_type);
-            eprintln!("Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
+            if let Some(proxy_addr) = &self.proxy_wallet_address {
+                eprintln!("Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
+            }
         }
         
         let _client = auth_builder
@@ -471,41 +489,18 @@ impl PolymarketApi {
     }
 
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
+        let signer = self.create_signer()?;
         
         // Build authentication builder with proxy wallet support
         let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
+
+        let (funder, sig_type) = self.resolve_auth_config(false)?;
+        if let Some(funder_address) = funder {
             auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
+        }
+        if let Some(sig_type) = sig_type {
             auth_builder = auth_builder.signature_type(sig_type);
         }
         
@@ -572,41 +567,18 @@ impl PolymarketApi {
         side: &str,
         order_type: Option<&str>,
     ) -> Result<OrderResponse> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
+        let signer = self.create_signer()?;
         
         // Build authentication builder with proxy wallet support
         let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
+
+        let (funder, sig_type) = self.resolve_auth_config(false)?;
+        if let Some(funder_address) = funder {
             auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
+        }
+        if let Some(sig_type) = sig_type {
             auth_builder = auth_builder.signature_type(sig_type);
         }
         
