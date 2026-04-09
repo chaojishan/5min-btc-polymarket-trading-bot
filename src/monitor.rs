@@ -1,7 +1,7 @@
 use crate::api::PolymarketApi;
 use crate::models::*;
 use anyhow::Result;
-use log::{debug, warn, error};
+use log::{debug, info, warn, error};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -240,10 +240,14 @@ impl MarketMonitor {
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
         
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
+        let now = chrono::Utc::now();
+        let ts = now
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+            .format("%Y-%m-%dT%H:%M:%S%.3f");
+        let ts_ms = now.timestamp_millis();
         let message = format!(
-            "[{}] {} Up Token {} Down Token {} remaining time:{}\n",
-            ts, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
+            "[{}] ts_ms:{} {} Up:{} Down:{} time:{}\n",
+            ts, ts_ms, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
         );
         crate::log_to_history(&message);
 
@@ -272,7 +276,15 @@ impl MarketMonitor {
     ) -> Option<TokenPrice> {
         let token_id = token_id.as_ref()?;
 
-        let buy_price = match self.api.get_price(token_id, "BUY").await {
+        // Run BUY/SELL in parallel: sequential was ~2× RTT per token; with Up/Down already
+        // parallel, total wall time was ~2× RTT per poll (often ~1s under load). Interval sleep
+        // runs *after* this, so high RTT directly reduces log frequency.
+        let (buy_res, sell_res) = tokio::join!(
+            self.api.get_price(token_id, "BUY"),
+            self.api.get_price(token_id, "SELL"),
+        );
+
+        let buy_price = match buy_res {
             Ok(price) => Some(price),
             Err(e) => {
                 warn!("Failed to fetch {} {} BUY price: {}", market_name, outcome, e);
@@ -280,7 +292,7 @@ impl MarketMonitor {
             }
         };
 
-        let sell_price = match self.api.get_price(token_id, "SELL").await {
+        let sell_price = match sell_res {
             Ok(price) => Some(price),
             Err(e) => {
                 warn!("Failed to fetch {} {} SELL price: {}", market_name, outcome, e);
@@ -435,7 +447,7 @@ impl MarketMonitor {
             let down_token_id = self.btc_15m_down_token_id.lock().await.clone();
 
             if up_token_id.is_none() || down_token_id.is_none() {
-                warn!("Token IDs not available, falling back to API polling");
+                warn!("Token IDs not available yet, retrying...");
                 sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -450,6 +462,9 @@ impl MarketMonitor {
 
                     let up_id = up_token_id.clone().unwrap();
                     let down_id = down_token_id.clone().unwrap();
+                    // If the period task calls `update_market`, condition_id changes but this loop would
+                    // otherwise keep parsing WS frames for the old asset_ids until the socket drops.
+                    let subscribed_condition_id = self.get_current_condition_id().await;
 
                     let subscribe_msg = json!({
                         "assets_ids": [up_id.clone(), down_id.clone()],
@@ -474,10 +489,51 @@ impl MarketMonitor {
                             msg = read.next() => {
                                 match msg {
                                     Some(Ok(Message::Text(text))) => {
+                                        if self.get_current_condition_id().await != subscribed_condition_id {
+                                            warn!(
+                                                "{}: condition_id changed (new period); reconnecting WebSocket",
+                                                self.market_name
+                                            );
+                                            break;
+                                        }
                                         if text == "PONG" {
                                             continue;
                                         }
                                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            match json.get("event_type").and_then(|v| v.as_str()) {
+                                                Some(
+                                                    et @ ("best_bid_ask" | "price_change"),
+                                                ) => {
+                                                    match serde_json::to_string_pretty(&json) {
+                                                        Ok(pretty) => {
+                                                            // info!("WSS price payload ({}):\n{}", et, pretty)
+                                                            info!("WSS price payload ({})", et)
+                                                        }
+                                                        Err(_) => info!("WSS price payload ({}): {:?}", et, json),
+                                                    }
+                                                }
+                                                Some(other) => {
+                                                    // info!(
+                                                    //     "WSS other event_type={} snippet: {}",
+                                                    //     other,
+                                                    //     text.chars().take(280).collect::<String>()
+                                                    // );
+                                                }
+                                                None => {
+                                                    // if json.is_array() {
+                                                    //     info!(
+                                                    //         "WSS JSON array (len={}): {}",
+                                                    //         json.as_array().map(|a| a.len()).unwrap_or(0),
+                                                    //         text.chars().take(400).collect::<String>()
+                                                    //     );
+                                                    // } else {
+                                                    //     info!(
+                                                    //         "WSS JSON (no event_type): {}",
+                                                    //         text.chars().take(400).collect::<String>()
+                                                    //     );
+                                                    // }
+                                                }
+                                            }
                                             if let Some(prices) = self.parse_websocket_message(&json, &up_id, &down_id).await {
                                                 if let Some(up) = prices.0 {
                                                     up_price = Some(up);
@@ -513,7 +569,15 @@ impl MarketMonitor {
                                     _ => {}
                                 }
                             }
+                            // Keepalive + detect market rollover: reconnect so we subscribe to new asset_ids.
                             _ = sleep(Duration::from_secs(1)) => {
+                                if self.get_current_condition_id().await != subscribed_condition_id {
+                                    warn!(
+                                        "{}: condition_id changed (new period); closing WebSocket to resubscribe",
+                                        self.market_name
+                                    );
+                                    break;
+                                }
                                 if last_ping.elapsed() >= Duration::from_secs(5) {
                                     if let Err(e) = write.send(Message::Text("PING".to_string())).await {
                                         error!("Failed to send PING: {}", e);
@@ -521,20 +585,13 @@ impl MarketMonitor {
                                     }
                                     last_ping = std::time::Instant::now();
                                 }
-                                
-                                if last_snapshot_time.elapsed() >= snapshot_interval {
-                                    if let Ok(snapshot) = self.fetch_market_data().await {
-                                        let _ = tx_send.send(snapshot);
-                                        last_snapshot_time = std::time::Instant::now();
-                                    }
-                                }
                             }
                         }
                     }
                 }
                 Err(e) => {
                     error!("Failed to connect to WebSocket: {}", e);
-                    warn!("Falling back to API polling for 30 seconds...");
+                    warn!("Retrying WebSocket connection in 30 seconds...");
                     sleep(Duration::from_secs(30)).await;
                 }
             }
@@ -585,75 +642,43 @@ impl MarketMonitor {
                 }
             }
             Some("price_change") => {
+                // One message may include both assets; do not return on first match or we drop the other leg.
                 if let Some(price_changes) = json.get("price_changes").and_then(|v| v.as_array()) {
+                    let mut up_tp: Option<TokenPrice> = None;
+                    let mut down_tp: Option<TokenPrice> = None;
                     for change in price_changes {
                         if let Some(asset_id) = change.get("asset_id").and_then(|v| v.as_str()) {
-                            let best_bid = change.get("best_bid")
+                            let best_bid = change
+                                .get("best_bid")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| rust_decimal::Decimal::from_str_exact(s).ok());
-                            let best_ask = change.get("best_ask")
+                            let best_ask = change
+                                .get("best_ask")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| rust_decimal::Decimal::from_str_exact(s).ok());
-                            
                             if asset_id == up_token_id {
-                                return Some((
-                                    Some(TokenPrice {
-                                        token_id: up_token_id.to_string(),
-                                        bid: best_bid,
-                                        ask: best_ask,
-                                    }),
-                                    None,
-                                ));
+                                up_tp = Some(TokenPrice {
+                                    token_id: up_token_id.to_string(),
+                                    bid: best_bid,
+                                    ask: best_ask,
+                                });
                             } else if asset_id == down_token_id {
-                                return Some((
-                                    None,
-                                    Some(TokenPrice {
-                                        token_id: down_token_id.to_string(),
-                                        bid: best_bid,
-                                        ask: best_ask,
-                                    }),
-                                ));
+                                down_tp = Some(TokenPrice {
+                                    token_id: down_token_id.to_string(),
+                                    bid: best_bid,
+                                    ask: best_ask,
+                                });
                             }
                         }
                     }
-                }
-            }
-            Some("book") => {
-                if let Some(asset_id) = json.get("asset_id").and_then(|v| v.as_str()) {
-                    let best_bid = json.get("bids")
-                        .and_then(|v| v.as_array())
-                        .and_then(|bids| bids.first())
-                        .and_then(|bid| bid.get("price"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| rust_decimal::Decimal::from_str_exact(s).ok());
-                    let best_ask = json.get("asks")
-                        .and_then(|v| v.as_array())
-                        .and_then(|asks| asks.first())
-                        .and_then(|ask| ask.get("price"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| rust_decimal::Decimal::from_str_exact(s).ok());
-                    
-                    if asset_id == up_token_id {
-                        return Some((
-                            Some(TokenPrice {
-                                token_id: up_token_id.to_string(),
-                                bid: best_bid,
-                                ask: best_ask,
-                            }),
-                            None,
-                        ));
-                    } else if asset_id == down_token_id {
-                        return Some((
-                            None,
-                            Some(TokenPrice {
-                                token_id: down_token_id.to_string(),
-                                bid: best_bid,
-                                ask: best_ask,
-                            }),
-                        ));
+                    if up_tp.is_some() || down_tp.is_some() {
+                        return Some((up_tp, down_tp));
                     }
                 }
             }
+            // Ignore `book` events for now.
+            // They can be partial/single-asset snapshots and array ordering is not guaranteed here,
+            // which can introduce unstable top-of-book values in our merged Up/Down view.
             _ => {}
         }
         None
@@ -722,10 +747,14 @@ impl MarketMonitor {
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
         
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
+        let now = chrono::Utc::now();
+        let ts = now
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+            .format("%Y-%m-%dT%H:%M:%S%.3f");
+        let ts_ms = now.timestamp_millis();
         let message = format!(
-            "[{}] {} Up Token {} Down Token {} remaining time:{}\n",
-            ts, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
+            "[{}] ts_ms:{} {} Up:{} Down:{} time:{}\n",
+            ts, ts_ms, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
         );
         crate::log_to_history(&message);
 
