@@ -96,6 +96,22 @@ async fn main() -> Result<()> {
 
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| {
+            let now = chrono::Utc::now();
+            let ts = now
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+                .format("%Y-%m-%dT%H:%M:%S%.3f");
+            let ts_ms = now.timestamp_millis();
+            writeln!(
+                buf,
+                "[{}] ts_ms:{} {:<5} {} {}",
+                ts,
+                ts_ms,
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
         .target(env_logger::Target::Pipe(Box::new(dual_writer)))
         .init();
 
