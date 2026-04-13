@@ -161,10 +161,10 @@ async fn main() -> Result<()> {
     let max_side_price = config.trading.max_side_price;
     let cooldown = config.trading.cooldown_seconds;
     let cooldown_1h = config.trading.cooldown_seconds_1h;
-    let shares_override = config.trading.shares;
+    let order_amount_usdc = config.trading.order_amount_usdc;
     let size_reduce_after_secs = config.trading.size_reduce_after_secs;
     let size_min_ratio = config.trading.size_min_ratio;
-    let size_min_shares = config.trading.size_min_shares;
+    let size_min_amount_usdc = config.trading.size_min_amount_usdc;
     let data_source = config.trading.data_source.clone();
 
     let timeframes = &config.trading.timeframes;
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     eprintln!("   Min side price: ${:.2} (no buy below)", min_side_price);
     eprintln!("   Max side price: ${:.2} (no buy above)", max_side_price);
     eprintln!("   Cooldown: {}s (1h: {}s)", cooldown, cooldown_1h);
-    eprintln!("   Shares: {:?} (default: BTC 5m=24)", shares_override);
+    eprintln!("   Order amount (USDC): {:?} (minimum: 1.1)", order_amount_usdc);
     eprintln!("   Order type: FAK (partial fills possible)");
     eprintln!("   Data source: {}", data_source.to_uppercase());
     eprintln!();
@@ -189,10 +189,10 @@ async fn main() -> Result<()> {
         max_side_price,
         cooldown,
         cooldown_1h,
-        shares_override,
+        order_amount_usdc,
         size_reduce_after_secs,
         size_min_ratio,
-        size_min_shares,
+        size_min_amount_usdc,
     ));
     let trader_closure = trader.clone();
     let market_closure_interval = config.trading.market_closure_check_interval_seconds;

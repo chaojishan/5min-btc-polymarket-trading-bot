@@ -76,17 +76,19 @@ pub struct TradingConfig {
     /// Min seconds between buys for 1h markets only (throttle 1h trading). Default 45.
     #[serde(default = "default_cooldown_seconds_1h")]
     pub cooldown_seconds_1h: u64,
-    /// Shares per side; if unset/0, use per-market default (BTC 5m=24).
-    pub shares: Option<f64>,
-    /// Reduce order size in the last N seconds (volatility). Default 300 (5 min).
+    /// Order amount per side in USDC. If unset/<=0, default to 1.1 USDC.
+    /// Backward-compatible: old `shares` field is also accepted as alias.
+    #[serde(alias = "shares")]
+    pub order_amount_usdc: Option<f64>,
+    /// Reduce order amount in the last N seconds (volatility). Default 300 (5 min).
     #[serde(default = "default_size_reduce_after_secs")]
     pub size_reduce_after_secs: u64,
-    /// When reducing: size = base * (min_ratio + (1-min_ratio)*time_left/reduce_window). Default 0.5.
+    /// When reducing: amount = base * (min_ratio + (1-min_ratio)*time_left/reduce_window). Default 0.5.
     #[serde(default = "default_size_min_ratio")]
     pub size_min_ratio: f64,
-    /// Minimum shares per order when reducing. Default 5.
-    #[serde(default = "default_size_min_shares")]
-    pub size_min_shares: f64,
+    /// Minimum order amount (USDC) after reduction. Default 1.1.
+    #[serde(default = "default_size_min_amount_usdc")]
+    pub size_min_amount_usdc: f64,
 }
 
 fn default_market_closure_check_interval() -> u64 {
@@ -133,8 +135,8 @@ fn default_size_min_ratio() -> f64 {
     0.5
 }
 
-fn default_size_min_shares() -> f64 {
-    5.0
+fn default_size_min_amount_usdc() -> f64 {
+    1.1
 }
 
 impl Default for Config {
@@ -161,10 +163,10 @@ impl Default for Config {
                 max_side_price: default_max_side_price(),
                 cooldown_seconds: default_cooldown_seconds(),
                 cooldown_seconds_1h: default_cooldown_seconds_1h(),
-                shares: None,
+                order_amount_usdc: None,
                 size_reduce_after_secs: default_size_reduce_after_secs(),
                 size_min_ratio: default_size_min_ratio(),
-                size_min_shares: default_size_min_shares(),
+                size_min_amount_usdc: default_size_min_amount_usdc(),
             },
         }
     }

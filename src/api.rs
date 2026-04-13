@@ -14,6 +14,8 @@ use std::sync::Arc;
 // Official SDK imports for proper order signing
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use alloy::signers::Signer as _;
@@ -40,6 +42,7 @@ sol! {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+type AuthedClobClient = ClobClient<Authenticated<Normal>>;
 
 pub struct PolymarketApi {
     client: Client,
@@ -54,6 +57,8 @@ pub struct PolymarketApi {
     signature_type: Option<u8>, // 0 = EOA, 1 = Proxy, 2 = GnosisSafe
     // Track if authentication was successful at startup
     authenticated: Arc<tokio::sync::Mutex<bool>>,
+    // Cached authenticated client for fast order placement
+    authed_clob_client: Arc<tokio::sync::Mutex<Option<Arc<AuthedClobClient>>>>,
 }
 
 impl PolymarketApi {
@@ -124,21 +129,19 @@ impl PolymarketApi {
             proxy_wallet_address,
             signature_type,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
+            authed_clob_client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
-    
 
-    /// Authenticate with Polymarket CLOB API at startup
-    pub async fn authenticate(&self) -> Result<()> {
+    async fn build_authenticated_clob_client(&self, warn_on_proxy_eoa: bool) -> Result<AuthedClobClient> {
         let signer = self.create_signer()
             .context("Private key is required for authentication. Please set private_key in config.json")?;
-        
-        // Build authentication builder with proxy wallet support
+
         let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer);
 
-        let (funder, sig_type) = self.resolve_auth_config(true)?;
+        let (funder, sig_type) = self.resolve_auth_config(warn_on_proxy_eoa)?;
         if let Some(funder_address) = funder {
             auth_builder = auth_builder.funder(funder_address);
         }
@@ -148,16 +151,67 @@ impl PolymarketApi {
                 eprintln!("Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
             }
         }
-        
-        let _client = auth_builder
+
+        auth_builder
             .authenticate()
             .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")?;
-        
-        // Mark as authenticated
+            .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")
+    }
+
+    async fn get_or_authenticate_clob_client(&self, warn_on_proxy_eoa: bool) -> Result<(Arc<AuthedClobClient>, bool)> {
+        {
+            let cached = self.authed_clob_client.lock().await;
+            if let Some(client) = cached.as_ref() {
+                return Ok((client.clone(), true));
+            }
+        }
+
+        let client = Arc::new(self.build_authenticated_clob_client(warn_on_proxy_eoa).await?);
+        {
+            let mut cached = self.authed_clob_client.lock().await;
+            *cached = Some(client.clone());
+        }
         *self.authenticated.lock().await = true;
-        
+        Ok((client, false))
+    }
+
+    async fn invalidate_cached_auth(&self) {
+        {
+            let mut cached = self.authed_clob_client.lock().await;
+            *cached = None;
+        }
+        *self.authenticated.lock().await = false;
+    }
+
+    /// Authenticate with Polymarket CLOB API at startup
+    pub async fn authenticate(&self) -> Result<()> {
+        let auth_start = Instant::now();
+        let (_, from_cache) = self.get_or_authenticate_clob_client(true).await?;
+        eprintln!(
+            "[认证] 认证完成（{}），耗时: {:.2} ms",
+            if from_cache { "复用缓存" } else { "新建认证" },
+            auth_start.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(())
+    }
+
+    pub async fn authenticate_if_needed(&self) -> Result<bool> {
+        let auth_start = Instant::now();
+        let already = *self.authenticated.lock().await;
+        if already {
+            eprintln!(
+                "[认证] 认证完成（复用缓存），耗时: {:.2} ms",
+                auth_start.elapsed().as_secs_f64() * 1000.0
+            );
+            return Ok(true);
+        }
+        let (_, from_cache) = self.get_or_authenticate_clob_client(false).await?;
+        eprintln!(
+            "[认证] 认证完成（{}），耗时: {:.2} ms",
+            if from_cache { "复用缓存" } else { "新建认证" },
+            auth_start.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(false)
     }
 
     fn generate_signature(
@@ -588,35 +642,31 @@ impl PolymarketApi {
         amount: f64,
         side: &str,
         order_type: Option<&str>,
+        preferred_price: Option<f64>,
+        query_position_after_order: bool,
         signal_start: Instant,
     ) -> Result<OrderResponse> {
         let enter_api_ms = signal_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[timing] signal→place_market_order entry: {:.2} ms (branch logs + execute_buy_fak prep)",
+            "[下单流程] 进入 place_market_order，信号触发到此耗时: {:.2} ms（含策略分支和执行前准备）",
             enter_api_ms
         );
 
+        eprintln!(
+            "[下单流程] 步骤1/5 准备下单参数：方向={}，数量={:.4}，token_id={}",
+            side, amount, token_id
+        );
         let auth_start = Instant::now();
         let signer = self.create_signer()?;
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-
-        let (funder, sig_type) = self.resolve_auth_config(false)?;
-        if let Some(funder_address) = funder {
-            auth_builder = auth_builder.funder(funder_address);
-        }
-        if let Some(sig_type) = sig_type {
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        let client = auth_builder
-            .authenticate()
+        let (client, from_cache) = self.get_or_authenticate_clob_client(false)
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
         let auth_ms = auth_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[下单流程] 步骤2/5 认证完成（{}），耗时: {:.2} ms",
+            if from_cache { "复用缓存" } else { "新建认证" },
+            auth_ms
+        );
         
         let side_enum = match side {
             "BUY" => Side::Buy,
@@ -635,13 +685,19 @@ impl PolymarketApi {
         
         let amount_decimal = Decimal::from_f64_retain(amount)
             .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
-            .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero);
         
-        eprintln!("Creating and posting MARKET order: {} {} {} (type: {:?})", 
-              side, amount_decimal, token_id, order_type_enum);
+        eprintln!(
+            "[下单流程] 步骤3/5 计算价格并构建订单：{} {} {}（类型: {:?}）",
+            side, amount_decimal, token_id, order_type_enum
+        );
         
         let price_start = Instant::now();
-        let market_price = if matches!(side_enum, Side::Buy) {
+        let market_price = if let Some(price) = preferred_price {
+            Decimal::from_f64_retain(price)
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert preferred price to Decimal"))?
+                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+        } else if matches!(side_enum, Side::Buy) {
             self.get_price(token_id, "SELL")
                 .await
                 .context("Failed to fetch ASK price for BUY order")?
@@ -652,26 +708,7 @@ impl PolymarketApi {
         };
         let get_price_ms = price_start.elapsed().as_secs_f64() * 1000.0;
         
-        eprintln!("Using current market price: ${:.4} for {} order", market_price, side);
-        
-        let order_builder = client
-            .limit_order()
-            .token_id(token_id)
-            .size(amount_decimal)
-            .price(market_price)
-            .side(side_enum);
-        
-        let build1_start = Instant::now();
-        let built1 = order_builder
-            .build()
-            .await
-            .context("Failed to build market order")?;
-        let build1_ms = build1_start.elapsed().as_secs_f64() * 1000.0;
-        let sign1_start = Instant::now();
-        let signed_order_first = client.sign(&signer, built1)
-            .await
-            .context("Failed to sign market order")?;
-        let sign1_ms = sign1_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[下单流程] 使用当前市场价: ${:.4}（{}）", market_price, side);
         
         let final_price = if matches!(side_enum, Side::Sell) {
             let price_f64 = f64::try_from(market_price).unwrap_or(0.0);
@@ -684,57 +721,132 @@ impl PolymarketApi {
         } else {
             market_price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
         };
+
+        // Polymarket market BUY requires maker amount max 2 decimals and taker amount max 4 decimals.
+        // We normalize BUY size so that (price * size) fits <= 2 decimals while keeping size <= 4 decimals.
+        let adjusted_amount_decimal = if matches!(side_enum, Side::Buy) {
+            let notional_2dp = (amount_decimal * final_price)
+                .round_dp_with_strategy(2, RoundingStrategy::ToZero);
+            if final_price > Decimal::ZERO {
+                (notional_2dp / final_price).round_dp_with_strategy(2, RoundingStrategy::ToZero)
+            } else {
+                amount_decimal
+            }
+        } else {
+            amount_decimal
+        };
         
-        let (signed_order, build2_ms, sign2_ms) = if matches!(side_enum, Side::Sell) && final_price != market_price {
+        let (signed_order, build_order_ms, sign_order_ms) = if matches!(side_enum, Side::Sell) && final_price != market_price {
             let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
             let market_price_f64 = f64::try_from(market_price).unwrap_or(0.0);
-            eprintln!("Adjusting SELL price from ${:.4} to ${:.4} for immediate execution", market_price_f64, final_price_f64);
+            eprintln!(
+                "[下单流程] SELL 价格微调以提升立即成交概率: ${:.4} -> ${:.4}",
+                market_price_f64, final_price_f64
+            );
             let adjusted_builder = client
                 .limit_order()
                 .token_id(token_id)
-                .size(amount_decimal)
+                .size(adjusted_amount_decimal)
                 .price(final_price)
-                .side(side_enum);
+                .side(side_enum)
+                .order_type(order_type_enum);
             let build2_start = Instant::now();
             let built2 = adjusted_builder
                 .build()
                 .await
-                .context("Failed to build adjusted market order")?;
+                .map_err(|e| anyhow::anyhow!(
+                    "Failed to build adjusted market order: {:?} | token_id={} side={} amount={} price={}",
+                    e, token_id, side, adjusted_amount_decimal, final_price
+                ))?;
             let b2 = build2_start.elapsed().as_secs_f64() * 1000.0;
             let sign2_start = Instant::now();
             let so = client.sign(&signer, built2)
                 .await
                 .context("Failed to sign adjusted market order")?;
             let s2 = sign2_start.elapsed().as_secs_f64() * 1000.0;
-            (so, Some(b2), Some(s2))
+            eprintln!(
+                "[下单流程] SELL 二次签名完成：二次构建 {:.2} ms，二次签名 {:.2} ms",
+                b2, s2
+            );
+            (so, b2, s2)
         } else {
-            (signed_order_first, None, None)
+            let base_builder = client
+                .limit_order()
+                .token_id(token_id)
+                .size(adjusted_amount_decimal)
+                .price(final_price)
+                .side(side_enum)
+                .order_type(order_type_enum);
+            let build_adj_start = Instant::now();
+            let built_adj = base_builder
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "Failed to build normalized market order: {:?} | token_id={} side={} amount={} price={} raw_amount={}",
+                    e, token_id, side, adjusted_amount_decimal, final_price, amount_decimal
+                ))?;
+            let b_adj = build_adj_start.elapsed().as_secs_f64() * 1000.0;
+            let sign_adj_start = Instant::now();
+            let signed_adj = client.sign(&signer, built_adj)
+                .await
+                .context("Failed to sign normalized market order")?;
+            let s_adj = sign_adj_start.elapsed().as_secs_f64() * 1000.0;
+            (signed_adj, b_adj, s_adj)
         };
+        eprintln!(
+            "[下单流程] 步骤4/5 签名完成：构建耗时 {:.2} ms，签名耗时 {:.2} ms",
+            build_order_ms, sign_order_ms
+        );
         
         let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
         
         let submit_at = Instant::now();
+        eprintln!("[下单流程] 步骤5/5 提交订单到交易所...");
         let response = match client.post_order(signed_order).await {
             Ok(resp) => resp,
             Err(e) => {
-                error!("SDK post_order error: {:?}", e);
-                anyhow::bail!("Failed to post market order: {:?}", e);
+                warn!("post_order 失败，清理认证缓存并重试一次: {:?}", e);
+                self.invalidate_cached_auth().await;
+                let (retry_client, _) = self.get_or_authenticate_clob_client(false)
+                    .await
+                    .context("Failed to re-authenticate after post_order failure")?;
+                let retry_builder = retry_client
+                    .limit_order()
+                    .token_id(token_id)
+                    .size(adjusted_amount_decimal)
+                    .price(final_price)
+                    .side(side_enum)
+                    .order_type(order_type_enum);
+                let retry_built = retry_builder
+                    .build()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(
+                        "Failed to rebuild market order for retry: {:?} | token_id={} side={} amount={} price={}",
+                        e, token_id, side, adjusted_amount_decimal, final_price
+                    ))?;
+                let retry_signed = retry_client
+                    .sign(&signer, retry_built)
+                    .await
+                    .context("Failed to sign market order for retry")?;
+                match retry_client.post_order(retry_signed).await {
+                    Ok(resp) => resp,
+                    Err(e2) => {
+                        error!("SDK post_order retry failed: {:?}", e2);
+                        anyhow::bail!("Failed to post market order after retry: {:?}", e2);
+                    }
+                }
             }
         };
         let post_ms = submit_at.elapsed().as_secs_f64() * 1000.0;
         let total_ms = signal_start.elapsed().as_secs_f64() * 1000.0;
         
-        eprintln!("[timing] --- market order breakdown (from signal) ---");
-        eprintln!("[timing]   authenticate (signer+client): {:.2} ms", auth_ms);
-        eprintln!("[timing]   get_price: {:.2} ms", get_price_ms);
-        eprintln!("[timing]   order build #1: {:.2} ms", build1_ms);
-        eprintln!("[timing]   order sign #1: {:.2} ms", sign1_ms);
-        if let (Some(b), Some(s)) = (build2_ms, sign2_ms) {
-            eprintln!("[timing]   order build #2 (sell adjust): {:.2} ms", b);
-            eprintln!("[timing]   order sign #2: {:.2} ms", s);
-        }
-        eprintln!("[timing]   post_order: {:.2} ms", post_ms);
-        eprintln!("[timing]   TOTAL signal→response: {:.2} ms", total_ms);
+        eprintln!("[下单耗时] ===== 市价单流程耗时明细（从信号触发开始） =====");
+        eprintln!("[下单耗时] 认证（signer+client）: {:.2} ms", auth_ms);
+        eprintln!("[下单耗时] 拉取价格（get_price）: {:.2} ms", get_price_ms);
+        eprintln!("[下单耗时] 构建订单: {:.2} ms", build_order_ms);
+        eprintln!("[下单耗时] 订单签名: {:.2} ms", sign_order_ms);
+        eprintln!("[下单耗时] 提交订单（post_order）: {:.2} ms", post_ms);
+        eprintln!("[下单耗时] 总耗时（signal -> response）: {:.2} ms", total_ms);
         
         let order_response = OrderResponse {
             order_id: Some(response.order_id.clone()),
@@ -747,7 +859,51 @@ impl PolymarketApi {
         };
         
         if response.success {
-            eprintln!("Market order executed successfully! Order ID: {}", response.order_id);
+            eprintln!("[下单结果] 交易所回包：");
+            eprintln!("[下单结果]   success={}", response.success);
+            eprintln!("[下单结果]   status={}", response.status);
+            eprintln!("[下单结果]   order_id={}", response.order_id);
+            eprintln!(
+                "[下单结果]   error_msg={}",
+                response.error_msg.as_deref().unwrap_or("无")
+            );
+            if query_position_after_order {
+                let pos_query_start = Instant::now();
+                match self.get_trading_address() {
+                    Ok(addr) => match self.get_position_size(&addr, token_id).await {
+                        Ok(Some(size)) => {
+                            eprintln!(
+                                "[下单结果] 当前仓位（token={}，地址={}）: {:.4}，查询耗时: {:.2} ms",
+                                token_id,
+                                addr,
+                                size,
+                                pos_query_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "[下单结果] 当前仓位查询无返回（token={}，地址={}），查询耗时: {:.2} ms",
+                                token_id,
+                                addr,
+                                pos_query_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[下单结果] 仓位查询失败（token={}，地址={}）：{}，查询耗时: {:.2} ms",
+                                token_id,
+                                addr,
+                                e,
+                                pos_query_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[下单结果] 无法获取交易地址，跳过仓位查询: {}", e);
+                    }
+                }
+            }
+            eprintln!("市价单执行成功！Order ID: {}", response.order_id);
             Ok(order_response)
         } else {
             let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");

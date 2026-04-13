@@ -24,6 +24,8 @@ const MAX_FLAT_BUYS_NO_POSITION: u32 = 4;
 const REBALANCE_COST_PER_PAIR_MAX: f64 = 1.02;
 /// Max buys of one side when rebalancing PnL (outcome skewed); can be higher than trend-follow limit.
 const MAX_REBALANCE_BUYS: u32 = 8;
+/// Exchange/SDK practical minimum notional for order acceptance.
+const MIN_ORDER_NOTIONAL_USDC: f64 = 1.1;
 
 #[derive(Debug, Clone, Default)]
 struct WaveState {
@@ -52,10 +54,10 @@ pub struct Trader {
     max_side_price: f64,
     cooldown_seconds: u64,
     cooldown_seconds_1h: u64,
-    shares_override: Option<f64>,
+    order_amount_usdc: Option<f64>,
     size_reduce_after_secs: u64,
     size_min_ratio: f64,
-    size_min_shares: f64,
+    size_min_amount_usdc: f64,
     last_buy: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     trades: Arc<Mutex<HashMap<String, CycleTrade>>>,
     total_profit: Arc<Mutex<f64>>,
@@ -87,10 +89,10 @@ impl Trader {
         max_side_price: f64,
         cooldown_seconds: u64,
         cooldown_seconds_1h: u64,
-        shares_override: Option<f64>,
+        order_amount_usdc: Option<f64>,
         size_reduce_after_secs: u64,
         size_min_ratio: f64,
-        size_min_shares: f64,
+        size_min_amount_usdc: f64,
     ) -> Self {
         Self {
             api,
@@ -100,10 +102,10 @@ impl Trader {
             max_side_price,
             cooldown_seconds,
             cooldown_seconds_1h,
-            shares_override,
+            order_amount_usdc,
             size_reduce_after_secs,
             size_min_ratio,
-            size_min_shares,
+            size_min_amount_usdc,
             last_buy: Arc::new(Mutex::new(HashMap::new())),
             trades: Arc::new(Mutex::new(HashMap::new())),
             total_profit: Arc::new(Mutex::new(0.0)),
@@ -151,38 +153,29 @@ impl Trader {
         }
     }
 
-    /// Base size per market (no time reduction). This 5m bot uses BTC 5m only.
-    fn base_shares_for_market(&self, market_name: &str) -> f64 {
-        if let Some(s) = self.shares_override {
-            if s > 0.0 {
-                return s;
+    /// Base order amount in USDC (no time reduction).
+    fn base_order_amount_usdc(&self) -> f64 {
+        if let Some(v) = self.order_amount_usdc {
+            if v > 0.0 {
+                return v.max(1.1);
             }
         }
-        let upper = market_name.to_uppercase();
-        if upper.starts_with("BTC") && (upper.contains("5") || upper.contains("5M")) {
-            24.0
-        } else if upper.starts_with("BTC") {
-            24.0
-        } else {
-            24.0
-        }
+        1.1
     }
 
-    /// Size to use for this snapshot: reduce toward market end (volatility). Target does this.
-    fn shares_for_market_with_time(
+    /// Order amount to use for this snapshot: reduce toward market end (volatility).
+    fn order_amount_usdc_with_time(
         &self,
-        market_name: &str,
         time_remaining_secs: u64,
-        _market_duration_secs: u64,
     ) -> f64 {
-        let base = self.base_shares_for_market(market_name);
+        let base = self.base_order_amount_usdc();
         if self.size_reduce_after_secs == 0 || time_remaining_secs >= self.size_reduce_after_secs {
             return base;
         }
         let ratio = self.size_min_ratio
             + (1.0 - self.size_min_ratio) * (time_remaining_secs as f64 / self.size_reduce_after_secs as f64);
-        let size = (base * ratio * 100.0).round() / 100.0;
-        size.max(self.size_min_shares)
+        let amount = (base * ratio * 100.0).round() / 100.0;
+        amount.max(self.size_min_amount_usdc).max(1.1)
     }
 
     pub async fn process_snapshot(&self, snapshot: &MarketSnapshot) -> Result<()> {
@@ -223,12 +216,23 @@ impl Trader {
                 .map(|e| (e.up_shares, e.down_shares, e.up_avg_price, e.down_avg_price))
                 .unwrap_or((0.0, 0.0, 0.0, 0.0))
         };
+        // One-shot mode: after one successful buy in this market period, stop trading
+        // until the next period starts (market_key includes period_timestamp).
+        if up_shares > 0.0 || down_shares > 0.0 {
+            return Ok(());
+        }
         let up_cost = up_shares * up_avg;
         let down_cost = down_shares * down_avg;
         let total_cost = up_cost + down_cost;
 
         let duration_secs = snapshot.market_duration_secs;
-        let size = self.shares_for_market_with_time(market_name, time_remaining, duration_secs);
+        let order_amount_usdc_raw = self.order_amount_usdc_with_time(time_remaining);
+        let order_amount_usdc = order_amount_usdc_raw.max(MIN_ORDER_NOTIONAL_USDC);
+        let size_up = ((order_amount_usdc / up_ask) * 100.0).floor() / 100.0;
+        let size_down = ((order_amount_usdc / down_ask) * 100.0).floor() / 100.0;
+        if size_up <= 0.0 || size_down <= 0.0 {
+            return Ok(());
+        }
 
         // Update price history and get trend (4–5 data points)
         let trend = self.update_trend(&market_key, current_time, up_ask, down_ask).await;
@@ -246,8 +250,8 @@ impl Trader {
             f64::MAX
         };
 
-        let new_up = up_shares + size;
-        let new_up_cost = up_cost + size * up_ask;
+        let new_up = up_shares + size_up;
+        let new_up_cost = up_cost + size_up * up_ask;
         let pairs_after_up = new_up.min(down_shares);
         // When we have more Down than Up, only the paired Up cost counts (marginal cost per pair).
         let cost_per_pair_up = if pairs_after_up > 0.0 {
@@ -260,8 +264,8 @@ impl Trader {
             f64::MAX
         };
 
-        let new_down = down_shares + size;
-        let new_down_cost = down_cost + size * down_ask;
+        let new_down = down_shares + size_down;
+        let new_down_cost = down_cost + size_down * down_ask;
         let pairs_after_down = up_shares.min(new_down);
         // When we have more Up than Down, only the paired Up cost counts (marginal cost per pair).
         let cost_per_pair_down = if pairs_after_down > 0.0 {
@@ -415,8 +419,15 @@ impl Trader {
             let cost_pp = if pairs_after_up > 0.0 { cost_per_pair_up } else { up_ask };
             crate::log_println!(
                 "📈 {}: buy Up | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
-                market_name, up_ask, size, cost_pp, self.cost_per_pair_max
+                market_name, up_ask, size_up, cost_pp, self.cost_per_pair_max
             );
+            if order_amount_usdc > order_amount_usdc_raw {
+                crate::log_println!(
+                    "   adjusted amount: ${:.2} -> ${:.2} (exchange minimum notional)",
+                    order_amount_usdc_raw,
+                    order_amount_usdc
+                );
+            }
             let (up_shares_after, up_avg_after, down_shares_after, down_avg_after, invest_up, invest_down, total_invest, pnl_if_up_wins, pnl_if_down_wins) = (
                 new_up,
                 new_up_cost / new_up,
@@ -435,19 +446,26 @@ impl Trader {
                 total_invest, pnl_if_up_wins, pnl_if_down_wins
             );
             if self.simulation_mode {
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_token_id.as_deref().unwrap_or(""), size, up_ask).await?;
+                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_token_id.as_deref().unwrap_or(""), size_up, up_ask).await?;
             } else if let Some(ref up_id) = up_token_id {
-                self.execute_buy_fak(market_name, "Up", up_id, size, up_ask, signal_start)
+                self.execute_buy_fak(market_name, "Up", up_id, size_up, up_ask, signal_start)
                     .await?;
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_id, size, up_ask).await?;
+                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_id, size_up, up_ask).await?;
             }
         } else {
             let signal_start = Instant::now();
             let cost_pp = if pairs_after_down > 0.0 { cost_per_pair_down } else { down_ask };
             crate::log_println!(
                 "📉 {}: buy Down | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
-                market_name, down_ask, size, cost_pp, self.cost_per_pair_max
+                market_name, down_ask, size_down, cost_pp, self.cost_per_pair_max
             );
+            if order_amount_usdc > order_amount_usdc_raw {
+                crate::log_println!(
+                    "   adjusted amount: ${:.2} -> ${:.2} (exchange minimum notional)",
+                    order_amount_usdc_raw,
+                    order_amount_usdc
+                );
+            }
             let (up_shares_after, up_avg_after, down_shares_after, down_avg_after, invest_up, invest_down, total_invest, pnl_if_up_wins, pnl_if_down_wins) = (
                 up_shares,
                 if up_shares > 0.0 { up_avg } else { 0.0 },
@@ -466,11 +484,11 @@ impl Trader {
                 total_invest, pnl_if_up_wins, pnl_if_down_wins
             );
             if self.simulation_mode {
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_token_id.as_deref().unwrap_or(""), size, down_ask).await?;
+                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_token_id.as_deref().unwrap_or(""), size_down, down_ask).await?;
             } else if let Some(ref down_id) = down_token_id {
-                self.execute_buy_fak(market_name, "Down", down_id, size, down_ask, signal_start)
+                self.execute_buy_fak(market_name, "Down", down_id, size_down, down_ask, signal_start)
                     .await?;
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_id, size, down_ask).await?;
+                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_id, size_down, down_ask).await?;
             }
         }
 
@@ -519,7 +537,15 @@ impl Trader {
         let shares_rounded = (shares * 10000.0).round() / 10000.0;
         match self
             .api
-            .place_market_order(token_id, shares_rounded, "BUY", Some("FAK"), signal_start)
+            .place_market_order(
+                token_id,
+                shares_rounded,
+                "BUY",
+                Some("FAK"),
+                Some(price),
+                false,
+                signal_start,
+            )
             .await
         {
             Ok(_) => crate::log_println!("REAL: FAK order placed"),
@@ -702,6 +728,13 @@ impl Trader {
         last.clear();
         let mut c = self.closure_checked.lock().await;
         c.clear();
+        if !self.simulation_mode {
+            match self.api.authenticate_if_needed().await {
+                Ok(true) => crate::log_println!("Auth status: already authenticated (reused)"),
+                Ok(false) => crate::log_println!("Auth status: authenticated at new period start"),
+                Err(e) => warn!("Failed to pre-authenticate on period reset: {}", e),
+            }
+        }
         crate::log_println!("Period reset");
     }
 

@@ -500,40 +500,40 @@ impl MarketMonitor {
                                             continue;
                                         }
                                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                            match json.get("event_type").and_then(|v| v.as_str()) {
-                                                Some(
-                                                    et @ ("best_bid_ask" | "price_change"),
-                                                ) => {
-                                                    match serde_json::to_string_pretty(&json) {
-                                                        Ok(pretty) => {
-                                                            // info!("WSS price payload ({}):\n{}", et, pretty)
-                                                            info!("WSS price payload ({})", et)
-                                                        }
-                                                        Err(_) => info!("WSS price payload ({}): {:?}", et, json),
-                                                    }
-                                                }
-                                                Some(other) => {
-                                                    // info!(
-                                                    //     "WSS other event_type={} snippet: {}",
-                                                    //     other,
-                                                    //     text.chars().take(280).collect::<String>()
-                                                    // );
-                                                }
-                                                None => {
-                                                    // if json.is_array() {
-                                                    //     info!(
-                                                    //         "WSS JSON array (len={}): {}",
-                                                    //         json.as_array().map(|a| a.len()).unwrap_or(0),
-                                                    //         text.chars().take(400).collect::<String>()
-                                                    //     );
-                                                    // } else {
-                                                    //     info!(
-                                                    //         "WSS JSON (no event_type): {}",
-                                                    //         text.chars().take(400).collect::<String>()
-                                                    //     );
-                                                    // }
-                                                }
-                                            }
+                                            // match json.get("event_type").and_then(|v| v.as_str()) {
+                                            //     Some(
+                                            //         et @ ("best_bid_ask" | "price_change"),
+                                            //     ) => {
+                                            //         match serde_json::to_string_pretty(&json) {
+                                            //             Ok(pretty) => {
+                                            //                 // info!("WSS price payload ({}):\n{}", et, pretty)
+                                            //                 info!("WSS price payload ({})", et)
+                                            //             }
+                                            //             Err(_) => info!("WSS price payload ({}): {:?}", et, json),
+                                            //         }
+                                            //     }
+                                            //     Some(other) => {
+                                            //         // info!(
+                                            //         //     "WSS other event_type={} snippet: {}",
+                                            //         //     other,
+                                            //         //     text.chars().take(280).collect::<String>()
+                                            //         // );
+                                            //     }
+                                            //     None => {
+                                            //         // if json.is_array() {
+                                            //         //     info!(
+                                            //         //         "WSS JSON array (len={}): {}",
+                                            //         //         json.as_array().map(|a| a.len()).unwrap_or(0),
+                                            //         //         text.chars().take(400).collect::<String>()
+                                            //         //     );
+                                            //         // } else {
+                                            //         //     info!(
+                                            //         //         "WSS JSON (no event_type): {}",
+                                            //         //         text.chars().take(400).collect::<String>()
+                                            //         //     );
+                                            //         // }
+                                            //     }
+                                            // }
                                             if let Some(prices) = self.parse_websocket_message(&json, &up_id, &down_id).await {
                                                 if let Some(up) = prices.0 {
                                                     up_price = Some(up);
