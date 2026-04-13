@@ -91,48 +91,74 @@ macro_rules! log_println {
     };
 }
 
+/// 设为 `false` 则不再写入 `history.toml`（仍向 stderr 打日志）。
+const LOG_TO_HISTORY_FILE: bool = false;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let history_path = "history.toml";
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)
-        .context("Failed to open history.toml for logging")?;
+    if LOG_TO_HISTORY_FILE {
+        let history_path = "history.toml";
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_path)
+            .context("Failed to open history.toml for logging")?;
 
-    let log_file_for_writer = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)
-        .context("Failed to open history.toml for writer")?;
+        let log_file_for_writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_path)
+            .context("Failed to open history.toml for writer")?;
 
-    init_history_file(log_file);
+        init_history_file(log_file);
 
-    let dual_writer = DualWriter {
-        stderr: io::stderr(),
-        file: Mutex::new(log_file_for_writer),
-    };
+        let dual_writer = DualWriter {
+            stderr: io::stderr(),
+            file: Mutex::new(log_file_for_writer),
+        };
 
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .format(|buf, record| {
-            let now = chrono::Utc::now();
-            let ts = now
-                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
-                .format("%Y-%m-%dT%H:%M:%S%.3f");
-            let ts_ms = now.timestamp_millis();
-            writeln!(
-                buf,
-                "[{}] ts_ms:{} {:<5} {} {}",
-                ts,
-                ts_ms,
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .target(env_logger::Target::Pipe(Box::new(dual_writer)))
-        .init();
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Info)
+            .format(|buf, record| {
+                let now = chrono::Utc::now();
+                let ts = now
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+                    .format("%Y-%m-%dT%H:%M:%S%.3f");
+                let ts_ms = now.timestamp_millis();
+                writeln!(
+                    buf,
+                    "[{}] ts_ms:{} {:<5} {} {}",
+                    ts,
+                    ts_ms,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            })
+            .target(env_logger::Target::Pipe(Box::new(dual_writer)))
+            .init();
+    } else {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Info)
+            .format(|buf, record| {
+                let now = chrono::Utc::now();
+                let ts = now
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+                    .format("%Y-%m-%dT%H:%M:%S%.3f");
+                let ts_ms = now.timestamp_millis();
+                writeln!(
+                    buf,
+                    "[{}] ts_ms:{} {:<5} {} {}",
+                    ts,
+                    ts_ms,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            })
+            .target(env_logger::Target::Stderr)
+            .init();
+    }
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
