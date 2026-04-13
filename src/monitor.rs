@@ -10,6 +10,15 @@ use serde_json::json;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
 
+macro_rules! eprintln {
+    () => {
+        crate::log_to_history(&format!("{}\n", crate::log_prefix()))
+    };
+    ($($arg:tt)*) => {
+        crate::log_println!($($arg)*)
+    };
+}
+
 pub struct MarketMonitor {
     api: Arc<PolymarketApi>,
     market_name: String,
@@ -248,6 +257,13 @@ impl MarketMonitor {
             ts, ts_ms, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
         );
         crate::log_to_history(&message);
+
+        if let Some(ref u) = btc_15m_up_price {
+            self.api.record_latest_token_top_of_book(u).await;
+        }
+        if let Some(ref d) = btc_15m_down_price {
+            self.api.record_latest_token_top_of_book(d).await;
+        }
 
         let btc_15m_market_data = MarketData {
             condition_id: btc_15m_id,
@@ -533,11 +549,13 @@ impl MarketMonitor {
                                             //     }
                                             // }
                                             if let Some(prices) = self.parse_websocket_message(&json, &up_id, &down_id).await {
-                                                if let Some(up) = prices.0 {
-                                                    up_price = Some(up);
+                                                if let Some(ref up) = prices.0 {
+                                                    self.api.record_latest_token_top_of_book(up).await;
+                                                    up_price = Some(up.clone());
                                                 }
-                                                if let Some(down) = prices.1 {
-                                                    down_price = Some(down);
+                                                if let Some(ref down) = prices.1 {
+                                                    self.api.record_latest_token_top_of_book(down).await;
+                                                    down_price = Some(down.clone());
                                                 }
                                                 
                                                 if last_snapshot_time.elapsed() >= snapshot_interval {
@@ -687,6 +705,13 @@ impl MarketMonitor {
         up_price: Option<TokenPrice>,
         down_price: Option<TokenPrice>,
     ) -> Result<MarketSnapshot> {
+        if let Some(ref u) = up_price {
+            self.api.record_latest_token_top_of_book(u).await;
+        }
+        if let Some(ref d) = down_price {
+            self.api.record_latest_token_top_of_book(d).await;
+        }
+
         let btc_15m_guard = self.btc_market_15m.lock().await;
         let btc_15m_slug = btc_15m_guard.slug.clone();
         let btc_15m_id = btc_15m_guard.condition_id.clone();

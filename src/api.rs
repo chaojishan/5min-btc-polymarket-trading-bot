@@ -2,9 +2,10 @@ use crate::models::*;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Instant;
+use tokio::sync::RwLock;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
@@ -28,6 +29,15 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy_sol_types::SolCall;
+
+macro_rules! eprintln {
+    () => {
+        crate::log_to_history(&format!("{}\n", crate::log_prefix()))
+    };
+    ($($arg:tt)*) => {
+        crate::log_println!($($arg)*)
+    };
+}
 
 // CTF redeemPositions - match Polymarket/rs-clob-client and Gnosis ConditionalTokens.sol
 sol! {
@@ -59,9 +69,23 @@ pub struct PolymarketApi {
     authenticated: Arc<tokio::sync::Mutex<bool>>,
     // Cached authenticated client for fast order placement
     authed_clob_client: Arc<tokio::sync::Mutex<Option<Arc<AuthedClobClient>>>>,
+    // Track token metadata warmup status to avoid repeated HTTP calls
+    warmed_token_ids: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Best bid/ask per token from WSS / REST polling; `place_market_order` reads here so retries use current book.
+    latest_bid_by_token: Arc<RwLock<HashMap<String, f64>>>,
+    latest_ask_by_token: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 impl PolymarketApi {
+    fn log_order_flow(message: &str) {
+        let now = chrono::Utc::now();
+        let ts = now
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+            .format("%Y-%m-%dT%H:%M:%S%.3f");
+        let ts_ms = now.timestamp_millis();
+        eprintln!("[{}] ts_ms:{} {}", ts, ts_ms, message);
+    }
+
     fn create_signer(&self) -> Result<PrivateKeySigner> {
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
@@ -130,7 +154,42 @@ impl PolymarketApi {
             signature_type,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
             authed_clob_client: Arc::new(tokio::sync::Mutex::new(None)),
+            warmed_token_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            latest_bid_by_token: Arc::new(RwLock::new(HashMap::new())),
+            latest_ask_by_token: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Update top-of-book cache from monitor (WSS or REST). BUY uses ask; SELL uses bid.
+    pub async fn record_latest_token_top_of_book(&self, tp: &TokenPrice) {
+        let tid = tp.token_id.as_str();
+        if let Some(bid) = tp.bid {
+            let f: f64 = bid.to_string().parse().unwrap_or(0.0);
+            if f > 0.0 && f.is_finite() {
+                self.latest_bid_by_token.write().await.insert(tid.to_string(), f);
+            }
+        }
+        if let Some(ask) = tp.ask {
+            let f: f64 = ask.to_string().parse().unwrap_or(0.0);
+            if f > 0.0 && f.is_finite() {
+                self.latest_ask_by_token.write().await.insert(tid.to_string(), f);
+            }
+        }
+    }
+
+    async fn market_order_price_hint_decimal(
+        &self,
+        token_id: &str,
+        side: Side,
+    ) -> Option<rust_decimal::Decimal> {
+        use rust_decimal::Decimal;
+        use rust_decimal::RoundingStrategy;
+        let f = match side {
+            Side::Buy => self.latest_ask_by_token.read().await.get(token_id).copied(),
+            Side::Sell => self.latest_bid_by_token.read().await.get(token_id).copied(),
+            _ => None,
+        }?;
+        Decimal::from_f64_retain(f).map(|d| d.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero))
     }
 
     async fn build_authenticated_clob_client(&self, warn_on_proxy_eoa: bool) -> Result<AuthedClobClient> {
@@ -212,6 +271,67 @@ impl PolymarketApi {
             auth_start.elapsed().as_secs_f64() * 1000.0
         );
         Ok(false)
+    }
+
+    /// Warm up SDK internal metadata caches (tick size + fee rate) for specific tokens.
+    /// This reduces first-order build latency for `market_order().build()`.
+    pub async fn prewarm_token_metadata_if_needed(&self, token_ids: &[String]) -> Result<()> {
+        if token_ids.is_empty() {
+            return Ok(());
+        }
+        let (client, _) = self.get_or_authenticate_clob_client(false).await?;
+
+        let mut to_warm: Vec<String> = Vec::new();
+        {
+            let warmed = self.warmed_token_ids.lock().await;
+            for token_id in token_ids {
+                if !token_id.is_empty() && !warmed.contains(token_id) {
+                    to_warm.push(token_id.clone());
+                }
+            }
+        }
+        if to_warm.is_empty() {
+            return Ok(());
+        }
+
+        let warm_start = Instant::now();
+        let mut warmed_successfully: Vec<String> = Vec::new();
+        for token_id in &to_warm {
+            let token_id_u256 = match U256::from_str(token_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("[预热] 跳过无效 token_id {}: {}", token_id, e);
+                    continue;
+                }
+            };
+            let (tick_res, fee_res) = tokio::join!(
+                client.tick_size(token_id_u256),
+                client.fee_rate_bps(token_id_u256)
+            );
+            match (tick_res, fee_res) {
+                (Ok(_), Ok(_)) => warmed_successfully.push(token_id.clone()),
+                (tick, fee) => {
+                    warn!(
+                        "[预热] token {} 预热失败: tick_size={:?}, fee_rate={:?}",
+                        token_id,
+                        tick.err(),
+                        fee.err()
+                    );
+                }
+            }
+        }
+        if !warmed_successfully.is_empty() {
+            let mut warmed = self.warmed_token_ids.lock().await;
+            for token_id in warmed_successfully {
+                warmed.insert(token_id);
+            }
+        }
+        eprintln!(
+            "[预热] token 元数据预热完成：请求 {} 个，耗时 {:.2} ms",
+            to_warm.len(),
+            warm_start.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
     }
 
     fn generate_signature(
@@ -327,6 +447,54 @@ impl PolymarketApi {
         
         log::debug!("Fetched {} active markets from events endpoint", all_markets.len());
         Ok(all_markets)
+    }
+
+    /// Startup network latency baseline for Polymarket endpoints.
+    /// This check is non-critical and should not block the trading flow.
+    pub async fn run_startup_latency_test(&self) -> Result<()> {
+        eprintln!("[延时测试] 开始 Polymarket 启动延时测试...");
+
+        let gamma_url = format!("{}/events?limit=1&active=true&closed=false", self.gamma_url);
+        let clob_url = format!("{}/time", self.clob_url);
+
+        let gamma_start = Instant::now();
+        let gamma_req = self.client.get(&gamma_url).send();
+        let clob_start = Instant::now();
+        let clob_req = self.client.get(&clob_url).send();
+
+        let (gamma_resp, clob_resp) = tokio::join!(gamma_req, clob_req);
+
+        match gamma_resp {
+            Ok(resp) => {
+                let ms = gamma_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[延时测试] Gamma /events: {:.2} ms (status={})",
+                    ms,
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                let ms = gamma_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[延时测试] Gamma /events: FAIL after {:.2} ms ({})", ms, e);
+            }
+        }
+
+        match clob_resp {
+            Ok(resp) => {
+                let ms = clob_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[延时测试] CLOB /time: {:.2} ms (status={})",
+                    ms,
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                let ms = clob_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[延时测试] CLOB /time: FAIL after {:.2} ms ({})", ms, e);
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn get_market_by_slug(&self, slug: &str) -> Result<Market> {
@@ -644,32 +812,19 @@ impl PolymarketApi {
         amount: f64,
         side: &str,
         order_type: Option<&str>,
-        preferred_price: Option<f64>,
         query_position_after_order: bool,
         signal_start: Instant,
     ) -> Result<OrderResponse> {
-        let enter_api_ms = signal_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[下单流程] 进入 place_market_order，信号触发到此耗时: {:.2} ms（含策略分支和执行前准备）",
-            enter_api_ms
-        );
-
-        eprintln!(
-            "[下单流程] 步骤1/5 准备下单参数：方向={}，金额(USDC)={:.4}，token_id={}",
+        Self::log_order_flow(&format!(
+            "[下单流程] 开始：{} 金额(USDC)={:.4} token={}",
             side, amount, token_id
-        );
+        ));
         let auth_start = Instant::now();
         let signer = self.create_signer()?;
-        let (client, from_cache) = self.get_or_authenticate_clob_client(false)
+        let (client, _from_cache) = self.get_or_authenticate_clob_client(false)
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
         let auth_ms = auth_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[下单流程] 步骤2/5 认证完成（{}），耗时: {:.2} ms",
-            if from_cache { "复用缓存" } else { "新建认证" },
-            auth_ms
-        );
-        
         let side_enum = match side {
             "BUY" => Side::Buy,
             "SELL" => Side::Sell,
@@ -691,23 +846,7 @@ impl PolymarketApi {
             .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
             .round_dp_with_strategy(2, RoundingStrategy::ToZero);
         
-        eprintln!(
-            "[下单流程] 步骤3/5 构建市价单：{} {} {}（类型: {:?}）",
-            side, amount_decimal, token_id, order_type_enum
-        );
-        let preferred_price_decimal = if let Some(price) = preferred_price {
-            let price_decimal = Decimal::from_f64_retain(price)
-                .ok_or_else(|| anyhow::anyhow!("Failed to convert preferred price to Decimal"))?
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
-            eprintln!(
-                "[下单流程] 使用外部传入价格加速构建（跳过SDK内部订单簿取价）: ${:.4}",
-                price_decimal
-            );
-            Some(price_decimal)
-        } else {
-            eprintln!("[下单流程] 未传入价格，使用SDK实时订单簿定价");
-            None
-        };
+        let preferred_price_decimal = self.market_order_price_hint_decimal(token_id, side_enum).await;
 
         // In sdk 0.4.4, market BUY should use Amount::usdc(...).
         // `amount` passed by trader is already USDC notional; do NOT multiply by price again.
@@ -747,13 +886,7 @@ impl PolymarketApi {
             .await
             .context("Failed to sign market order")?;
         let sign_order_ms = sign_adj_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[下单流程] 步骤4/5 签名完成：构建耗时 {:.2} ms，签名耗时 {:.2} ms",
-            build_order_ms, sign_order_ms
-        );
-        
         let submit_at = Instant::now();
-        eprintln!("[下单流程] 步骤5/5 提交订单到交易所...");
         let response = match client.post_order(signed_order).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -762,13 +895,14 @@ impl PolymarketApi {
                 let (retry_client, _) = self.get_or_authenticate_clob_client(false)
                     .await
                     .context("Failed to re-authenticate after post_order failure")?;
+                let retry_price_hint = self.market_order_price_hint_decimal(token_id, side_enum).await;
                 let mut retry_builder = retry_client
                     .market_order()
                     .token_id(token_id_u256)
                     .amount(order_amount)
                     .side(side_enum)
                     .order_type(order_type_enum.clone());
-                if let Some(price) = preferred_price_decimal {
+                if let Some(price) = retry_price_hint {
                     retry_builder = retry_builder.price(price);
                 }
                 let retry_built = retry_builder
@@ -797,7 +931,7 @@ impl PolymarketApi {
         eprintln!("[下单耗时] ===== 市价单流程耗时明细（从信号触发开始） =====");
         eprintln!("[下单耗时] 认证（signer+client）: {:.2} ms", auth_ms);
         eprintln!(
-            "[下单耗时] 拉取价格（get_price）: 0.00 ms（已移除；传price则跳过SDK订单簿取价）"
+            "[下单耗时] 盘口价: 来自 monitor 写入的全局 best bid/ask（重试时会重新读取）"
         );
         eprintln!("[下单耗时] 构建订单: {:.2} ms", build_order_ms);
         eprintln!("[下单耗时] 订单签名: {:.2} ms", sign_order_ms);
@@ -819,9 +953,36 @@ impl PolymarketApi {
             eprintln!("[下单结果]   success={}", response.success);
             eprintln!("[下单结果]   status={}", response.status);
             eprintln!("[下单结果]   order_id={}", response.order_id);
+            eprintln!("[下单结果]   making_amount={}", response.making_amount);
+            eprintln!("[下单结果]   taking_amount={}", response.taking_amount);
+            eprintln!(
+                "[下单结果]   trade_ids={}",
+                if response.trade_ids.is_empty() {
+                    "[]".to_string()
+                } else {
+                    format!("{:?}", response.trade_ids)
+                }
+            );
+            eprintln!(
+                "[下单结果]   transaction_hashes={}",
+                if response.transaction_hashes.is_empty() {
+                    "[]".to_string()
+                } else {
+                    let hashes: Vec<String> = response
+                        .transaction_hashes
+                        .iter()
+                        .map(|h| format!("{:#x}", h))
+                        .collect();
+                    format!("{:?}", hashes)
+                }
+            );
             eprintln!(
                 "[下单结果]   error_msg={}",
-                response.error_msg.as_deref().unwrap_or("无")
+                response
+                    .error_msg
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("无")
             );
             if query_position_after_order {
                 let pos_query_start = Instant::now();

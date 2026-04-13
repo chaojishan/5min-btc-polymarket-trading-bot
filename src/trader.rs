@@ -204,6 +204,20 @@ impl Trader {
             return Ok(());
         }
 
+        // Prewarm SDK token metadata cache once per token to reduce first-order build latency.
+        if !self.simulation_mode {
+            let mut warmup_token_ids: Vec<String> = Vec::new();
+            if let Some(id) = market_data.up_token.as_ref().map(|t| t.token_id.clone()) {
+                warmup_token_ids.push(id);
+            }
+            if let Some(id) = market_data.down_token.as_ref().map(|t| t.token_id.clone()) {
+                warmup_token_ids.push(id);
+            }
+            if let Err(e) = self.api.prewarm_token_metadata_if_needed(&warmup_token_ids).await {
+                warn!("Failed to prewarm token metadata: {}", e);
+            }
+        }
+
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -559,7 +573,6 @@ impl Trader {
                 order_amount_usdc_rounded,
                 "BUY",
                 Some("FAK"),
-                Some(price),
                 false,
                 signal_start,
             )

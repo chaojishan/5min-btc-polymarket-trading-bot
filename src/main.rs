@@ -19,6 +19,15 @@ use api::PolymarketApi;
 use monitor::MarketMonitor;
 use trader::Trader;
 
+macro_rules! eprintln {
+    () => {
+        crate::log_to_history(&format!("{}\n", crate::log_prefix()))
+    };
+    ($($arg:tt)*) => {
+        crate::log_println!($($arg)*)
+    };
+}
+
 struct DualWriter {
     stderr: io::Stderr,
     file: Mutex<File>,
@@ -51,6 +60,15 @@ fn init_history_file(file: File) {
     HISTORY_FILE.set(Mutex::new(file)).expect("History file already initialized");
 }
 
+pub fn log_prefix() -> String {
+    let now = chrono::Utc::now();
+    let ts = now
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"))
+        .format("%Y-%m-%dT%H:%M:%S%.3f");
+    let ts_ms = now.timestamp_millis();
+    format!("[{}] ts_ms:{}", ts, ts_ms)
+}
+
 pub fn log_to_history(message: &str) {
     eprint!("{}", message);
     let _ = io::stderr().flush();
@@ -67,7 +85,8 @@ macro_rules! log_println {
     ($($arg:tt)*) => {
         {
             let message = format!($($arg)*);
-            $crate::log_to_history(&format!("{}\n", message));
+            let prefix = $crate::log_prefix();
+            $crate::log_to_history(&format!("{} {}\n", prefix, message));
         }
     };
 }
@@ -128,6 +147,10 @@ async fn main() -> Result<()> {
         config.polymarket.proxy_wallet_address.clone(),
         config.polymarket.signature_type,
     ));
+
+    if let Err(e) = api.run_startup_latency_test().await {
+        warn!("Startup latency test failed: {}", e);
+    }
 
     if args.redeem {
         run_redeem_only(api.as_ref(), &config, args.condition_id.as_deref()).await?;
