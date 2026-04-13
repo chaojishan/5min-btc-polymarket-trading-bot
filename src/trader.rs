@@ -448,7 +448,15 @@ impl Trader {
             if self.simulation_mode {
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_token_id.as_deref().unwrap_or(""), size_up, up_ask).await?;
             } else if let Some(ref up_id) = up_token_id {
-                self.execute_buy_fak(market_name, "Up", up_id, size_up, up_ask, signal_start)
+                self.execute_buy_fak(
+                    market_name,
+                    "Up",
+                    up_id,
+                    size_up,
+                    order_amount_usdc,
+                    up_ask,
+                    signal_start,
+                )
                     .await?;
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_id, size_up, up_ask).await?;
             }
@@ -486,7 +494,15 @@ impl Trader {
             if self.simulation_mode {
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_token_id.as_deref().unwrap_or(""), size_down, down_ask).await?;
             } else if let Some(ref down_id) = down_token_id {
-                self.execute_buy_fak(market_name, "Down", down_id, size_down, down_ask, signal_start)
+                self.execute_buy_fak(
+                    market_name,
+                    "Down",
+                    down_id,
+                    size_down,
+                    order_amount_usdc,
+                    down_ask,
+                    signal_start,
+                )
                     .await?;
                 self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_id, size_down, down_ask).await?;
             }
@@ -527,6 +543,7 @@ impl Trader {
         side: &str,
         token_id: &str,
         shares: f64,
+        order_amount_usdc: f64,
         price: f64,
         signal_start: Instant,
     ) -> Result<()> {
@@ -534,12 +551,12 @@ impl Trader {
             "{} BUY {} {:.2} shares @ ${:.4} (FAK - partial fill possible)",
             market_name, side, shares, price
         );
-        let shares_rounded = (shares * 10000.0).round() / 10000.0;
+        let order_amount_usdc_rounded = (order_amount_usdc * 100.0).round() / 100.0;
         match self
             .api
             .place_market_order(
                 token_id,
-                shares_rounded,
+                order_amount_usdc_rounded,
                 "BUY",
                 Some("FAK"),
                 Some(price),

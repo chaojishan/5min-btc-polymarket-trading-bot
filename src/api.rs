@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 // Official SDK imports for proper order signing
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::clob::types::{Amount, Side, OrderType, SignatureType};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::POLYGON;
@@ -578,13 +578,15 @@ impl PolymarketApi {
             .context(format!("Failed to parse price: {}", order.price))?;
         let size = rust_decimal::Decimal::from_str(&order.size)
             .context(format!("Failed to parse size: {}", order.size))?;
+        let token_id_u256 = U256::from_str(&order.token_id)
+            .context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
         
         eprintln!("Creating and posting order: {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
         
         let order_builder = client
             .limit_order()
-            .token_id(&order.token_id)
+            .token_id(token_id_u256)
             .size(size)
             .price(price)
             .side(side);
@@ -653,7 +655,7 @@ impl PolymarketApi {
         );
 
         eprintln!(
-            "[下单流程] 步骤1/5 准备下单参数：方向={}，数量={:.4}，token_id={}",
+            "[下单流程] 步骤1/5 准备下单参数：方向={}，金额(USDC)={:.4}，token_id={}",
             side, amount, token_id
         );
         let auth_start = Instant::now();
@@ -673,6 +675,8 @@ impl PolymarketApi {
             "SELL" => Side::Sell,
             _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", side),
         };
+        let token_id_u256 = U256::from_str(token_id)
+            .context(format!("Failed to parse token_id as U256: {}", token_id))?;
         
         let order_type_enum = match order_type.unwrap_or("FOK") {
             "FOK" => OrderType::FOK,
@@ -688,117 +692,65 @@ impl PolymarketApi {
             .round_dp_with_strategy(2, RoundingStrategy::ToZero);
         
         eprintln!(
-            "[下单流程] 步骤3/5 计算价格并构建订单：{} {} {}（类型: {:?}）",
+            "[下单流程] 步骤3/5 构建市价单：{} {} {}（类型: {:?}）",
             side, amount_decimal, token_id, order_type_enum
         );
-        
-        let price_start = Instant::now();
-        let market_price = if let Some(price) = preferred_price {
-            Decimal::from_f64_retain(price)
+        let preferred_price_decimal = if let Some(price) = preferred_price {
+            let price_decimal = Decimal::from_f64_retain(price)
                 .ok_or_else(|| anyhow::anyhow!("Failed to convert preferred price to Decimal"))?
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
-        } else if matches!(side_enum, Side::Buy) {
-            self.get_price(token_id, "SELL")
-                .await
-                .context("Failed to fetch ASK price for BUY order")?
+                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+            eprintln!(
+                "[下单流程] 使用外部传入价格加速构建（跳过SDK内部订单簿取价）: ${:.4}",
+                price_decimal
+            );
+            Some(price_decimal)
         } else {
-            self.get_price(token_id, "BUY")
-                .await
-                .context("Failed to fetch BID price for SELL order")?
-        };
-        let get_price_ms = price_start.elapsed().as_secs_f64() * 1000.0;
-        
-        eprintln!("[下单流程] 使用当前市场价: ${:.4}（{}）", market_price, side);
-        
-        let final_price = if matches!(side_enum, Side::Sell) {
-            let price_f64 = f64::try_from(market_price).unwrap_or(0.0);
-            let adjusted_f64 = price_f64 * 0.995;
-            let rounded_f64 = (adjusted_f64 * 100.0).round() / 100.0;
-            let final_f64 = rounded_f64.max(0.01);
-            Decimal::from_f64_retain(final_f64)
-                .ok_or_else(|| anyhow::anyhow!("Failed to convert adjusted price to Decimal"))?
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
-        } else {
-            market_price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+            eprintln!("[下单流程] 未传入价格，使用SDK实时订单簿定价");
+            None
         };
 
-        // Polymarket market BUY requires maker amount max 2 decimals and taker amount max 4 decimals.
-        // We normalize BUY size so that (price * size) fits <= 2 decimals while keeping size <= 4 decimals.
-        let adjusted_amount_decimal = if matches!(side_enum, Side::Buy) {
-            let notional_2dp = (amount_decimal * final_price)
-                .round_dp_with_strategy(2, RoundingStrategy::ToZero);
-            if final_price > Decimal::ZERO {
-                (notional_2dp / final_price).round_dp_with_strategy(2, RoundingStrategy::ToZero)
-            } else {
-                amount_decimal
+        // In sdk 0.4.4, market BUY should use Amount::usdc(...).
+        // `amount` passed by trader is already USDC notional; do NOT multiply by price again.
+        let order_amount = match side_enum {
+            Side::Buy => {
+                let usdc_amount = amount_decimal.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+                Amount::usdc(usdc_amount)
+                    .map_err(|e| anyhow::anyhow!("Failed to build BUY amount(usdc={}): {:?}", usdc_amount, e))?
             }
-        } else {
-            amount_decimal
+            Side::Sell => {
+                Amount::shares(amount_decimal)
+                    .map_err(|e| anyhow::anyhow!("Failed to build SELL amount(shares={}): {:?}", amount_decimal, e))?
+            }
+            _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", side),
         };
         
-        let (signed_order, build_order_ms, sign_order_ms) = if matches!(side_enum, Side::Sell) && final_price != market_price {
-            let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
-            let market_price_f64 = f64::try_from(market_price).unwrap_or(0.0);
-            eprintln!(
-                "[下单流程] SELL 价格微调以提升立即成交概率: ${:.4} -> ${:.4}",
-                market_price_f64, final_price_f64
-            );
-            let adjusted_builder = client
-                .limit_order()
-                .token_id(token_id)
-                .size(adjusted_amount_decimal)
-                .price(final_price)
-                .side(side_enum)
-                .order_type(order_type_enum);
-            let build2_start = Instant::now();
-            let built2 = adjusted_builder
-                .build()
-                .await
-                .map_err(|e| anyhow::anyhow!(
-                    "Failed to build adjusted market order: {:?} | token_id={} side={} amount={} price={}",
-                    e, token_id, side, adjusted_amount_decimal, final_price
-                ))?;
-            let b2 = build2_start.elapsed().as_secs_f64() * 1000.0;
-            let sign2_start = Instant::now();
-            let so = client.sign(&signer, built2)
-                .await
-                .context("Failed to sign adjusted market order")?;
-            let s2 = sign2_start.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "[下单流程] SELL 二次签名完成：二次构建 {:.2} ms，二次签名 {:.2} ms",
-                b2, s2
-            );
-            (so, b2, s2)
-        } else {
-            let base_builder = client
-                .limit_order()
-                .token_id(token_id)
-                .size(adjusted_amount_decimal)
-                .price(final_price)
-                .side(side_enum)
-                .order_type(order_type_enum);
-            let build_adj_start = Instant::now();
-            let built_adj = base_builder
-                .build()
-                .await
-                .map_err(|e| anyhow::anyhow!(
-                    "Failed to build normalized market order: {:?} | token_id={} side={} amount={} price={} raw_amount={}",
-                    e, token_id, side, adjusted_amount_decimal, final_price, amount_decimal
-                ))?;
-            let b_adj = build_adj_start.elapsed().as_secs_f64() * 1000.0;
-            let sign_adj_start = Instant::now();
-            let signed_adj = client.sign(&signer, built_adj)
-                .await
-                .context("Failed to sign normalized market order")?;
-            let s_adj = sign_adj_start.elapsed().as_secs_f64() * 1000.0;
-            (signed_adj, b_adj, s_adj)
-        };
+        let mut base_builder = client
+            .market_order()
+            .token_id(token_id_u256)
+            .amount(order_amount)
+            .side(side_enum)
+            .order_type(order_type_enum.clone());
+        if let Some(price) = preferred_price_decimal {
+            base_builder = base_builder.price(price);
+        }
+        let build_adj_start = Instant::now();
+        let built_adj = base_builder
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to build market order: {:?} | token_id={} side={} amount={}",
+                e, token_id, side, amount_decimal
+            ))?;
+        let build_order_ms = build_adj_start.elapsed().as_secs_f64() * 1000.0;
+        let sign_adj_start = Instant::now();
+        let signed_order = client.sign(&signer, built_adj)
+            .await
+            .context("Failed to sign market order")?;
+        let sign_order_ms = sign_adj_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[下单流程] 步骤4/5 签名完成：构建耗时 {:.2} ms，签名耗时 {:.2} ms",
             build_order_ms, sign_order_ms
         );
-        
-        let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
         
         let submit_at = Instant::now();
         eprintln!("[下单流程] 步骤5/5 提交订单到交易所...");
@@ -810,19 +762,21 @@ impl PolymarketApi {
                 let (retry_client, _) = self.get_or_authenticate_clob_client(false)
                     .await
                     .context("Failed to re-authenticate after post_order failure")?;
-                let retry_builder = retry_client
-                    .limit_order()
-                    .token_id(token_id)
-                    .size(adjusted_amount_decimal)
-                    .price(final_price)
+                let mut retry_builder = retry_client
+                    .market_order()
+                    .token_id(token_id_u256)
+                    .amount(order_amount)
                     .side(side_enum)
-                    .order_type(order_type_enum);
+                    .order_type(order_type_enum.clone());
+                if let Some(price) = preferred_price_decimal {
+                    retry_builder = retry_builder.price(price);
+                }
                 let retry_built = retry_builder
                     .build()
                     .await
                     .map_err(|e| anyhow::anyhow!(
-                        "Failed to rebuild market order for retry: {:?} | token_id={} side={} amount={} price={}",
-                        e, token_id, side, adjusted_amount_decimal, final_price
+                        "Failed to rebuild market order for retry: {:?} | token_id={} side={} amount={}",
+                        e, token_id, side, amount_decimal
                     ))?;
                 let retry_signed = retry_client
                     .sign(&signer, retry_built)
@@ -842,7 +796,9 @@ impl PolymarketApi {
         
         eprintln!("[下单耗时] ===== 市价单流程耗时明细（从信号触发开始） =====");
         eprintln!("[下单耗时] 认证（signer+client）: {:.2} ms", auth_ms);
-        eprintln!("[下单耗时] 拉取价格（get_price）: {:.2} ms", get_price_ms);
+        eprintln!(
+            "[下单耗时] 拉取价格（get_price）: 0.00 ms（已移除；传price则跳过SDK订单簿取价）"
+        );
         eprintln!("[下单耗时] 构建订单: {:.2} ms", build_order_ms);
         eprintln!("[下单耗时] 订单签名: {:.2} ms", sign_order_ms);
         eprintln!("[下单耗时] 提交订单（post_order）: {:.2} ms", post_ms);
@@ -913,7 +869,6 @@ impl PolymarketApi {
                 Token ID: {}\n\
                 Side: {}\n\
                 Size: {}\n\
-                Price: ${:.4}\n\
                 \n\
                 Possible reasons:\n\
                 1. Insufficient balance or allowance\n\
@@ -924,8 +879,7 @@ impl PolymarketApi {
                 response.order_id,
                 token_id,
                 side,
-                amount_decimal,
-                final_price_f64
+                amount_decimal
             );
         }
     }

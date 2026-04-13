@@ -203,7 +203,7 @@ impl MarketMonitor {
         let btc_15m_up_token_id = self.btc_15m_up_token_id.lock().await.clone();
         let btc_15m_down_token_id = self.btc_15m_down_token_id.lock().await.clone();
         
-        // Always fetch prices so we show BID/ASK when CLOB has them (even if remaining is 0)
+        // Always fetch prices so we show BUY-side (BID) when CLOB has them (even if remaining is 0)
         let (btc_15m_up_price, btc_15m_down_price) = tokio::join!(
             self.fetch_token_price(&btc_15m_up_token_id, &self.market_name, "Up"),
             self.fetch_token_price(&btc_15m_down_token_id, &self.market_name, "Down"),
@@ -225,19 +225,17 @@ impl MarketMonitor {
         };
         
         let btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
-        let format_price_with_both = |p: &TokenPrice| -> String {
+        let format_price_bid_only = |p: &TokenPrice| -> String {
             let bid = p.bid.unwrap_or(rust_decimal::Decimal::ZERO);
-            let ask = p.ask.unwrap_or(rust_decimal::Decimal::ZERO);
             let bid_f64: f64 = bid.to_string().parse().unwrap_or(0.0);
-            let ask_f64: f64 = ask.to_string().parse().unwrap_or(0.0);
-            format!("BID:${:.2} ASK:${:.2}", bid_f64, ask_f64)
+            format!("BID:${:.2}", bid_f64)
         };
 
         let btc_15m_up_str = btc_15m_up_price.as_ref()
-            .map(format_price_with_both)
+            .map(format_price_bid_only)
             .unwrap_or_else(|| "N/A".to_string());
         let btc_15m_down_str = btc_15m_down_price.as_ref()
-            .map(format_price_with_both)
+            .map(format_price_bid_only)
             .unwrap_or_else(|| "N/A".to_string());
         
         let now = chrono::Utc::now();
@@ -732,19 +730,17 @@ impl MarketMonitor {
         };
 
         let btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
-        let format_price_with_both = |p: &TokenPrice| -> String {
+        let format_price_bid_only = |p: &TokenPrice| -> String {
             let bid = p.bid.unwrap_or(rust_decimal::Decimal::ZERO);
-            let ask = p.ask.unwrap_or(rust_decimal::Decimal::ZERO);
             let bid_f64: f64 = bid.to_string().parse().unwrap_or(0.0);
-            let ask_f64: f64 = ask.to_string().parse().unwrap_or(0.0);
-            format!("BID:${:.2} ASK:${:.2}", bid_f64, ask_f64)
+            format!("BID:${:.2}", bid_f64)
         };
 
         let btc_15m_up_str = up_price.as_ref()
-            .map(format_price_with_both)
+            .map(format_price_bid_only)
             .unwrap_or_else(|| "N/A".to_string());
         let btc_15m_down_str = down_price.as_ref()
-            .map(format_price_with_both)
+            .map(format_price_bid_only)
             .unwrap_or_else(|| "N/A".to_string());
         
         let now = chrono::Utc::now();
