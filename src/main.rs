@@ -92,7 +92,7 @@ macro_rules! log_println {
 }
 
 /// 设为 `false` 则不再写入 `history.toml`（仍向 stderr 打日志）。
-const LOG_TO_HISTORY_FILE: bool = false;
+const LOG_TO_HISTORY_FILE: bool = true;
 
 #[tokio::main]
 async fn main() -> Result<()> {

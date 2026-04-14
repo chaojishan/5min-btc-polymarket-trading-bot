@@ -1,21 +1,14 @@
 # ==================== 第一阶段：编译 ====================
-FROM rust:1.94 AS builder
+FROM rust:1.94-bullseye AS builder
 
 WORKDIR /app
 
-# 缓存依赖层（默认 x86_64-unknown-linux-gnu，与 native-tls/openssl 兼容）
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-
-# 复制完整源码
+# 复制完整源码并编译（避免占位 main 产物被误用）
 COPY . .
-
-# 正式编译
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # ==================== 第二阶段：最终镜像 ====================
-FROM debian:trixie-slim
+FROM debian:bullseye-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
