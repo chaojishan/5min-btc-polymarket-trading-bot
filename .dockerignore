@@ -1,0 +1,21 @@
+# 构建产物（体积最大，且不应进镜像）
+/target
+**/target/
+
+# 版本库与编辑器
+.git
+.gitignore
+.cursor
+.vscode
+
+# 本地密钥与日志（config.json 若需打进镜像则不要加入忽略列表）
+.env
+*.log
+history.toml
+**/*.rs.bk
+
+# 非编译必需文件（减小上下文）
+README.md
+docs/
+logic.md
+ecosystem.config.cjs
