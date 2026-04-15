@@ -26,6 +26,8 @@ const REBALANCE_COST_PER_PAIR_MAX: f64 = 1.02;
 const MAX_REBALANCE_BUYS: u32 = 8;
 /// Exchange/SDK practical minimum notional for order acceptance.
 const MIN_ORDER_NOTIONAL_USDC: f64 = 1.1;
+/// After this many successful orders in the same market period, skip further trading until next period.
+const MAX_ORDERS_PER_PERIOD: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 struct WaveState {
@@ -33,6 +35,8 @@ struct WaveState {
     buys_down_since_lock: u32,
     /// When no position and flat, how many "buy higher side" we did (max MAX_FLAT_BUYS_NO_POSITION).
     flat_buys_since_lock: u32,
+    /// Successful BUY orders in this period (`market_key`); used to cap activity per period.
+    orders_placed_this_period: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -224,17 +228,21 @@ impl Trader {
             .as_secs();
 
         let market_key = format!("{}:{}", condition_id, period_timestamp);
+        let orders_placed = {
+            let wave = self.wave_state.lock().await;
+            wave.get(&market_key)
+                .map(|s| s.orders_placed_this_period)
+                .unwrap_or(0)
+        };
+        if orders_placed >= MAX_ORDERS_PER_PERIOD {
+            return Ok(());
+        }
         let (up_shares, down_shares, up_avg, down_avg) = {
             let t = self.trades.lock().await;
             t.get(&market_key)
                 .map(|e| (e.up_shares, e.down_shares, e.up_avg_price, e.down_avg_price))
                 .unwrap_or((0.0, 0.0, 0.0, 0.0))
         };
-        // One-shot mode: after one successful buy in this market period, stop trading
-        // until the next period starts (market_key includes period_timestamp).
-        if up_shares > 0.0 || down_shares > 0.0 {
-            return Ok(());
-        }
         let up_cost = up_shares * up_avg;
         let down_cost = down_shares * down_avg;
         let total_cost = up_cost + down_cost;
@@ -522,7 +530,7 @@ impl Trader {
             }
         }
 
-        // Update wave state: reset on lock, else increment side or flat_buys
+        // Update wave state: reset on lock, else increment side or flat_buys; count successful orders per period.
         {
             let mut wave = self.wave_state.lock().await;
             let state = wave.entry(market_key.clone()).or_default();
@@ -545,6 +553,10 @@ impl Trader {
                         state.flat_buys_since_lock = (state.flat_buys_since_lock + 1).min(MAX_FLAT_BUYS_NO_POSITION);
                     }
                 }
+            }
+            if do_buy_up || do_buy_down {
+                let n = (do_buy_up as u32) + (do_buy_down as u32);
+                state.orders_placed_this_period = state.orders_placed_this_period.saturating_add(n);
             }
         }
 

@@ -164,6 +164,16 @@ Logs go to `history.toml` (and your configured log target). Example price line:
 [2026-02-04T23:17:23] BTC 5m Up Token BID:$0.52 ASK:$0.53 Down Token BID:$0.47 ASK:$0.48 remaining time:4m 12s
 ```
 
+
+docker build -t polymarket-bot .
+
+docker create --name tmp-bot polymarket-bot
+docker cp tmp-bot:/usr/local/bin/polymarket-arbitrage-bot .\polymarket-arbitrage-bot
+docker rm tmp-bot
+
+chmod +x polymarket-arbitrage-bot
+./polymarket-arbitrage-bot --production --config config.json
+
 ---
 
 ## Project structure
